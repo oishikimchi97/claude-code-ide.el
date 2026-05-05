@@ -975,15 +975,15 @@ Signals an error if terminal fails to initialize."
 
      ;; mistty backend
      ((eq claude-code-ide-terminal-backend 'mistty)
-      ;; mistty-create accepts the command directly. Its internal term
-      ;; buffer (separate from the work buffer) is where the process
-      ;; lives — read `mistty-proc' to retrieve it.
+      ;; mistty-create internally calls `mistty--pop-to-buffer' which
+      ;; would disrupt the caller's window layout. Wrap with
+      ;; save-window-excursion so the layout is restored before
+      ;; claude-code-ide places the buffer in its side window.
+      ;; The process lives on the inner term buffer, accessed via
+      ;; the work buffer's local `mistty-proc' variable.
       (let* ((cmd-parts (claude-code-ide--parse-command-string claude-cmd))
              (process-environment (append env-vars process-environment))
-             ;; mistty--pop-to-buffer is called inside mistty-create; we
-             ;; let that happen freely, then claude-code-ide will move
-             ;; the buffer to the side window afterwards.
-             (buffer (mistty-create cmd-parts)))
+             (buffer (save-window-excursion (mistty-create cmd-parts))))
         (unless buffer
           (error "Failed to create mistty buffer"))
         ;; Rename to the canonical claude-code session buffer name.
