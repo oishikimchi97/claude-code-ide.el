@@ -975,20 +975,21 @@ Signals an error if terminal fails to initialize."
 
      ;; mistty backend
      ((eq claude-code-ide-terminal-backend 'mistty)
-      ;; mistty-create reads `mistty-shell-command' (let-bound below) when
-      ;; the new buffer is initialized. Env vars must be present on
-      ;; `process-environment' at the time term.el spawns the process.
+      ;; mistty-create accepts the command directly. Its internal term
+      ;; buffer (separate from the work buffer) is where the process
+      ;; lives — read `mistty-proc' to retrieve it.
       (let* ((cmd-parts (claude-code-ide--parse-command-string claude-cmd))
-             (mistty-shell-command cmd-parts)
              (process-environment (append env-vars process-environment))
-             (buffer (save-window-excursion (mistty-create))))
+             ;; mistty--pop-to-buffer is called inside mistty-create; we
+             ;; let that happen freely, then claude-code-ide will move
+             ;; the buffer to the side window afterwards.
+             (buffer (mistty-create cmd-parts)))
         (unless buffer
           (error "Failed to create mistty buffer"))
-        ;; The mistty buffer comes back with an auto-generated name; rename
-        ;; to the requested buffer-name so session lookups work.
+        ;; Rename to the canonical claude-code session buffer name.
         (with-current-buffer buffer
           (rename-buffer buffer-name t))
-        (let ((process (get-buffer-process buffer)))
+        (let ((process (buffer-local-value 'mistty-proc buffer)))
           (unless process
             (error "Failed to start mistty process"))
           (cons buffer process))))
@@ -1080,9 +1081,10 @@ This function handles:
                     ;; eat uses kill-buffer-on-exit variable
                     (setq-local eat-kill-buffer-on-exit t))
                    ((eq claude-code-ide-terminal-backend 'mistty)
-                    ;; mistty's underlying term process; add a sentinel to kill
-                    ;; the buffer when claude exits so a fresh session can start.
-                    (when-let ((proc (get-buffer-process buffer)))
+                    ;; mistty's process lives in its internal term buffer,
+                    ;; reachable via `mistty-proc'. Wrap the existing
+                    ;; sentinel to also kill the work buffer on exit.
+                    (when-let ((proc (buffer-local-value 'mistty-proc buffer)))
                       (let ((existing (process-sentinel proc)))
                         (set-process-sentinel
                          proc
