@@ -88,6 +88,14 @@
 (declare-function eat-term-display-cursor "eat" (terminal))
 (declare-function eat--adjust-process-window-size "eat" (process windows))
 
+;; External function/variable declarations for mistty
+(defvar mistty-shell-command)
+(defvar mistty-prompt-map)
+(defvar mistty-fullscreen)
+(declare-function mistty-create "mistty" (&optional command other-window))
+(declare-function mistty-send-string "mistty" (str))
+(declare-function mistty-send-key "mistty" (&optional n key positional))
+
 ;;; Customization
 
 (defgroup claude-code-ide nil
@@ -215,12 +223,16 @@ display-buffer behavior."
 
 (defcustom claude-code-ide-terminal-backend 'vterm
   "Terminal backend to use for Claude Code sessions.
-Can be either `vterm' or `eat'.  The vterm backend is the default
-and provides a fully-featured terminal emulator.  The eat backend
-is an alternative terminal emulator that may work better in some
-environments."
+Can be `vterm', `eat', or `mistty'.  The vterm backend is the
+default and provides a fully-featured terminal emulator.  The eat
+backend is an alternative terminal emulator that may work better
+in some environments.  The mistty backend is a frontend on top of
+term.el with always-editable command line and native shell
+completion; useful when Emacs input methods or comint-style
+editing are needed."
   :type '(choice (const :tag "vterm" vterm)
-                 (const :tag "eat" eat))
+                 (const :tag "eat" eat)
+                 (const :tag "mistty" mistty))
   :group 'claude-code-ide)
 
 (defcustom claude-code-ide-no-flicker nil
@@ -453,14 +465,19 @@ cursor management, and process buffering for superior user experience."
     (unless (featurep 'vterm)
       (require 'vterm nil t))
     (unless (featurep 'vterm)
-      (user-error "The package vterm is not installed.  Please install the vterm package or change `claude-code-ide-terminal-backend' to 'eat")))
+      (user-error "The package vterm is not installed.  Please install the vterm package or change `claude-code-ide-terminal-backend' to 'eat or 'mistty")))
    ((eq claude-code-ide-terminal-backend 'eat)
     (unless (featurep 'eat)
       (require 'eat nil t))
     (unless (featurep 'eat)
-      (user-error "The package eat is not installed.  Please install the eat package or change `claude-code-ide-terminal-backend' to 'vterm")))
+      (user-error "The package eat is not installed.  Please install the eat package or change `claude-code-ide-terminal-backend' to 'vterm or 'mistty")))
+   ((eq claude-code-ide-terminal-backend 'mistty)
+    (unless (featurep 'mistty)
+      (require 'mistty nil t))
+    (unless (featurep 'mistty)
+      (user-error "The package mistty is not installed.  Please install the mistty package or change `claude-code-ide-terminal-backend' to 'vterm or 'eat")))
    (t
-    (user-error "Invalid terminal backend: %s.  Valid options are 'vterm or 'eat" claude-code-ide-terminal-backend))))
+    (user-error "Invalid terminal backend: %s.  Valid options are 'vterm, 'eat, or 'mistty" claude-code-ide-terminal-backend))))
 
 (defun claude-code-ide--terminal-send-string (string)
   "Send STRING to the terminal in the current buffer."
@@ -470,6 +487,8 @@ cursor management, and process buffering for superior user experience."
    ((eq claude-code-ide-terminal-backend 'eat)
     (when eat-terminal
       (eat-term-send-string eat-terminal string)))
+   ((eq claude-code-ide-terminal-backend 'mistty)
+    (mistty-send-string string))
    (t
     (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend))))
 
@@ -481,6 +500,8 @@ cursor management, and process buffering for superior user experience."
    ((eq claude-code-ide-terminal-backend 'eat)
     (when eat-terminal
       (eat-term-send-string eat-terminal "\e")))
+   ((eq claude-code-ide-terminal-backend 'mistty)
+    (mistty-send-string "\e"))
    (t
     (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend))))
 
@@ -492,6 +513,8 @@ cursor management, and process buffering for superior user experience."
    ((eq claude-code-ide-terminal-backend 'eat)
     (when eat-terminal
       (eat-term-send-string eat-terminal "\r")))
+   ((eq claude-code-ide-terminal-backend 'mistty)
+    (mistty-send-string "\r"))
    (t
     (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend))))
 
@@ -522,6 +545,11 @@ This function binds:
     ;; We use local-set-key to make it buffer-local
     (local-set-key (kbd "S-<return>") #'claude-code-ide-insert-newline)
     (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape))
+   ((eq claude-code-ide-terminal-backend 'mistty)
+    ;; mistty: keys typed at the prompt go through Emacs editing first.
+    ;; Buffer-local bindings still apply since prompt-map inherits from major mode.
+    (local-set-key (kbd "S-<return>") #'claude-code-ide-insert-newline)
+    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape))
    (t
     (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend))))
 
@@ -538,6 +566,10 @@ This function binds:
   (pcase claude-code-ide-terminal-backend
     ('vterm #'vterm--window-adjust-process-window-size)
     ('eat #'eat--adjust-process-window-size)
+    ;; mistty defers to term.el's window-process-size adjustment, which is
+    ;; not exposed as a single standalone function suitable for advising;
+    ;; the reflow filter is a no-op for mistty.
+    ('mistty #'ignore)
     (_ (error "Unsupported terminal backend: %s" claude-code-ide-terminal-backend))))
 
 (defun claude-code-ide--terminal-scroll-mode-active-p ()
@@ -545,6 +577,8 @@ This function binds:
   (pcase claude-code-ide-terminal-backend
     ('vterm (bound-and-true-p vterm-copy-mode))
     ('eat (not (bound-and-true-p eat--semi-char-mode)))
+    ;; mistty has no copy-mode equivalent; the prompt is always editable.
+    ('mistty nil)
     (_ nil)))
 
 (defun claude-code-ide--session-buffer-p (buffer)
@@ -611,7 +645,9 @@ If DIRECTORY is not provided, use the current working directory."
   "Set the Claude Code PROCESS for DIRECTORY or current working directory."
   ;; Check if this is the first session starting
   (when (and claude-code-ide-prevent-reflow-glitch
-             (= (hash-table-count claude-code-ide--processes) 0))
+             (= (hash-table-count claude-code-ide--processes) 0)
+             ;; mistty defers reflow handling to term.el; skip the advice.
+             (not (eq claude-code-ide-terminal-backend 'mistty)))
     ;; Apply advice globally for the first session
     (advice-add (claude-code-ide--terminal-resize-handler)
                 :around #'claude-code-ide--terminal-reflow-filter))
@@ -697,7 +733,8 @@ If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
           (remhash directory claude-code-ide--processes)
           ;; Check if this was the last session
           (when (and claude-code-ide-prevent-reflow-glitch
-                     (= (hash-table-count claude-code-ide--processes) 0))
+                     (= (hash-table-count claude-code-ide--processes) 0)
+                     (not (eq claude-code-ide-terminal-backend 'mistty)))
             ;; Remove advice globally when no sessions remain
             (advice-remove (claude-code-ide--terminal-resize-handler)
                            #'claude-code-ide--terminal-reflow-filter))
@@ -936,6 +973,26 @@ Signals an error if terminal fails to initialize."
               (error "Failed to create eat process.  Please ensure eat is properly installed"))
             (cons buffer process)))))
 
+     ;; mistty backend
+     ((eq claude-code-ide-terminal-backend 'mistty)
+      ;; mistty-create reads `mistty-shell-command' (let-bound below) when
+      ;; the new buffer is initialized. Env vars must be present on
+      ;; `process-environment' at the time term.el spawns the process.
+      (let* ((cmd-parts (claude-code-ide--parse-command-string claude-cmd))
+             (mistty-shell-command cmd-parts)
+             (process-environment (append env-vars process-environment))
+             (buffer (save-window-excursion (mistty-create))))
+        (unless buffer
+          (error "Failed to create mistty buffer"))
+        ;; The mistty buffer comes back with an auto-generated name; rename
+        ;; to the requested buffer-name so session lookups work.
+        (with-current-buffer buffer
+          (rename-buffer buffer-name t))
+        (let ((process (get-buffer-process buffer)))
+          (unless process
+            (error "Failed to start mistty process"))
+          (cons buffer process))))
+
      (t
       (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend)))))
 
@@ -1021,7 +1078,19 @@ This function handles:
                               nil t))
                    ((eq claude-code-ide-terminal-backend 'eat)
                     ;; eat uses kill-buffer-on-exit variable
-                    (setq-local eat-kill-buffer-on-exit t))))
+                    (setq-local eat-kill-buffer-on-exit t))
+                   ((eq claude-code-ide-terminal-backend 'mistty)
+                    ;; mistty's underlying term process; add a sentinel to kill
+                    ;; the buffer when claude exits so a fresh session can start.
+                    (when-let ((proc (get-buffer-process buffer)))
+                      (let ((existing (process-sentinel proc)))
+                        (set-process-sentinel
+                         proc
+                         (lambda (p msg)
+                           (when existing (funcall existing p msg))
+                           (when (and (memq (process-status p) '(exit signal))
+                                      (buffer-live-p buffer))
+                             (kill-buffer buffer)))))))))
                 ;; Stabilization period for terminal layout initialization
                 (sleep-for claude-code-ide-terminal-initialization-delay)
                 ;; Display the buffer in a side window
